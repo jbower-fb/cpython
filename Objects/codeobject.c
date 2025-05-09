@@ -11,6 +11,8 @@
 #include "pycore_tuple.h"         // _PyTuple_ITEMS()
 #include "clinic/codeobject.c.h"
 
+#include <sys/mman.h>
+
 static PyObject* code_repr(PyCodeObject *co);
 
 static const char *
@@ -543,6 +545,73 @@ remove_column_info(PyObject *locations)
     return res;
 }
 
+#define BUMP_CHUNK_SIZE (1024 * 1024 * 1024) // 1GiB, must be a power of 2
+
+// Process-global state for the bump allocator
+static struct {
+    char *current_ptr;    // Current allocation position
+    char *end_ptr;        // End of current memory region
+} code_allocator_state = {NULL, NULL};
+
+// Extend the bump allocator's memory region
+static int
+extend_code_bump_allocator(Py_ssize_t min_size)
+{
+    // Calculate how much to allocate (at least BUMP_CHUNK_SIZE, rounded up)
+    Py_ssize_t size = (min_size + BUMP_CHUNK_SIZE - 1) & ~(BUMP_CHUNK_SIZE - 1);
+
+    // Try to extend the existing region
+    void *ptr = mmap(code_allocator_state.end_ptr, size,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+
+    if (ptr == MAP_FAILED) {
+        // If MAP_FIXED fails, try without it
+        ptr = mmap(NULL, size,
+                  PROT_READ | PROT_WRITE,
+                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+        if (ptr == MAP_FAILED) {
+            return -1;
+        }
+
+        // We got memory but not contiguous
+        code_allocator_state.current_ptr = ptr;
+        code_allocator_state.end_ptr = ptr + size;
+    } else {
+        if (code_allocator_state.current_ptr == NULL) {
+            code_allocator_state.current_ptr = ptr;
+            code_allocator_state.end_ptr = ptr + size;
+        } else {
+            code_allocator_state.end_ptr += size;
+        }
+    }
+
+    return 0;
+}
+
+// Allocate memory from the bump allocator
+static void*
+code_bump_allocate(Py_ssize_t n_bytes)
+{
+    // Align the allocation to 8 bytes
+    n_bytes = (n_bytes + 7) & ~7;
+
+    // Check if we have enough space
+    if (code_allocator_state.current_ptr + n_bytes > code_allocator_state.end_ptr) {
+        // Need to extend
+        if (extend_code_bump_allocator(n_bytes) < 0) {
+            return NULL;
+        }
+    }
+
+    // Allocate from the bump pointer
+    void *result = code_allocator_state.current_ptr;
+    code_allocator_state.current_ptr += n_bytes;
+
+    return result;
+}
+
 /* The caller is responsible for ensuring that the given data is valid. */
 
 PyCodeObject *
@@ -580,13 +649,15 @@ _PyCode_New(struct _PyCodeConstructor *con)
         con->linetable = replacement_locations;
     }
 
-    Py_ssize_t size = PyBytes_GET_SIZE(con->code) / sizeof(_Py_CODEUNIT);
-    PyCodeObject *co = PyObject_NewVar(PyCodeObject, &PyCode_Type, size);
+    Py_ssize_t nitems = PyBytes_GET_SIZE(con->code) / sizeof(_Py_CODEUNIT);
+    Py_ssize_t size = _PyObject_VAR_SIZE(&PyCode_Type, nitems);
+    PyCodeObject *co = (PyCodeObject *)code_bump_allocate(size);
     if (co == NULL) {
         Py_XDECREF(replacement_locations);
         PyErr_NoMemory();
         return NULL;
     }
+    PyObject_InitVar(co, &PyCode_Type, nitems);
     init_code(co, con);
     Py_XDECREF(replacement_locations);
     return co;
@@ -1744,7 +1815,8 @@ code_dealloc(PyCodeObject *co)
         PyObject_ClearWeakRefs((PyObject*)co);
     }
     free_monitoring_data(co->_co_monitoring);
-    PyObject_Free(co);
+
+    // Data not actually freed as it comes from the the bump allocator.
 }
 
 static PyObject *
